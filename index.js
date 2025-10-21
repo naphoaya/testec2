@@ -20,6 +20,25 @@ const firehoseClient = new FirehoseClient({
   credentials: awsCredentials
 });
 
+// Validate required environment variables
+const requiredEnvVars = [
+  'OPENSEARCH_ENDPOINT',
+  'AWS_ACCESS_KEY_ID', 
+  'AWS_SECRET_ACCESS_KEY',
+  'FIREHOSE_DELIVERY_STREAM_NAME'
+];
+
+const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
+
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars);
+  console.error('Please set the following environment variables:');
+  missingEnvVars.forEach(varName => {
+    console.error(`  - ${varName}`);
+  });
+  process.exit(1);
+}
+
 // Configure OpenSearch client with credentials
 const opensearchClient = new Client({
   ...AwsSigv4Signer({
@@ -28,7 +47,11 @@ const opensearchClient = new Client({
     credentials: awsCredentials
   }),
   node: process.env.OPENSEARCH_ENDPOINT,
-  requestTimeout: 30000
+  requestTimeout: 60000, // Increase timeout to 60 seconds
+  compression: 'gzip',
+  ssl: {
+    rejectUnauthorized: false // For development/testing
+  }
 });
 
 app.use(cors());
@@ -43,8 +66,52 @@ app.get('/health', (req, res) => {
     environment: 'production',
     opensearchEndpoint: process.env.OPENSEARCH_ENDPOINT,
     firehoseStream: process.env.FIREHOSE_DELIVERY_STREAM_NAME,
-    hasCredentials: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
+    hasCredentials: !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY),
+    region: process.env.AWS_REGION || 'us-east-1'
   });
+});
+
+// Test OpenSearch connection
+app.get('/test-connection', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    console.log('🔍 Testing OpenSearch connection...');
+    console.log('Endpoint:', process.env.OPENSEARCH_ENDPOINT);
+    console.log('Region:', process.env.AWS_REGION || 'us-east-1');
+    
+    // Test basic connectivity first
+    const info = await opensearchClient.info();
+    const duration = Date.now() - startTime;
+    
+    res.json({
+      success: true,
+      message: 'OpenSearch connection successful!',
+      connectionTime: `${duration}ms`,
+      opensearchVersion: info.body.version.number,
+      clusterName: info.body.cluster_name,
+      endpoint: process.env.OPENSEARCH_ENDPOINT,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error('❌ OpenSearch connection failed:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      errorCode: error.code,
+      connectionTime: `${duration}ms`,
+      endpoint: process.env.OPENSEARCH_ENDPOINT,
+      troubleshooting: {
+        networkIssue: error.message.includes('timeout') || error.message.includes('ENOTFOUND'),
+        authIssue: error.message.includes('403') || error.message.includes('Forbidden'),
+        configIssue: error.message.includes('404') || error.message.includes('Not Found')
+      },
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Send data to Firehose
@@ -206,12 +273,30 @@ app.get('/search/pipe-data', async (req, res) => {
 
 // Real OpenSearch query endpoint
 app.get('/search/real-opensearch', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     const indexName = process.env.OPENSEARCH_INDEX || 'mydomain';
     const size = parseInt(req.query.size) || 10;
     const from = parseInt(req.query.from) || 0;
 
     console.log('🔍 Querying real OpenSearch from EC2...');
+    console.log('Index:', indexName);
+    console.log('Endpoint:', process.env.OPENSEARCH_ENDPOINT);
+    
+    // First check if the index exists
+    const indexExists = await opensearchClient.indices.exists({
+      index: indexName
+    });
+    
+    if (!indexExists.body) {
+      return res.status(404).json({
+        success: false,
+        error: `Index '${indexName}' does not exist`,
+        suggestion: 'Check your OPENSEARCH_INDEX environment variable or create the index first',
+        timestamp: new Date().toISOString()
+      });
+    }
     
     const response = await opensearchClient.search({
       index: indexName,
@@ -223,6 +308,8 @@ app.get('/search/real-opensearch', async (req, res) => {
       }
     });
 
+    const duration = Date.now() - startTime;
+
     res.json({
       success: true,
       total: response.body.hits.total.value || response.body.hits.total,
@@ -232,16 +319,34 @@ app.get('/search/real-opensearch', async (req, res) => {
         source: hit._source,
         score: hit._score
       })),
+      queryTime: `${duration}ms`,
       note: 'Real OpenSearch data successfully retrieved from EC2!',
       endpoint: process.env.OPENSEARCH_ENDPOINT,
+      index: indexName,
       timestamp: new Date().toISOString()
     });
 
   } catch (error) {
+    const duration = Date.now() - startTime;
     console.error('Real OpenSearch query failed:', error.message);
+    console.error('Error details:', {
+      code: error.code,
+      statusCode: error.statusCode,
+      meta: error.meta
+    });
+    
     res.status(500).json({
       success: false,
       error: `Failed to query real OpenSearch: ${error.message}`,
+      errorCode: error.code,
+      statusCode: error.statusCode,
+      queryTime: `${duration}ms`,
+      troubleshooting: {
+        timeoutIssue: error.message.includes('timeout') || error.message.includes('Request timed out'),
+        networkIssue: error.message.includes('ENOTFOUND') || error.message.includes('ECONNREFUSED'),
+        authIssue: error.message.includes('403') || error.message.includes('Forbidden'),
+        indexIssue: error.message.includes('404') || error.message.includes('index_not_found_exception')
+      },
       timestamp: new Date().toISOString()
     });
   }
